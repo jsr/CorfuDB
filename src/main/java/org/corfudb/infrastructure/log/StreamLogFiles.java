@@ -1,5 +1,7 @@
 package org.corfudb.infrastructure.log;
 
+import static org.corfudb.util.Utils.getChecksum;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
@@ -7,6 +9,7 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.nio.file.FileSystems;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -28,22 +31,32 @@ import org.corfudb.protocols.wireprotocol.ICorfuPayload;
 import org.corfudb.protocols.wireprotocol.IMetadata;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.infrastructure.LogUnitServer;
+import org.corfudb.runtime.exceptions.DataCorruptionException;
 import org.corfudb.runtime.exceptions.OverwriteException;
+import org.corfudb.util.BufferChecksum;
+import org.corfudb.util.Checksum;
+
 
 /**
- * This class implements the StreamLog by persisting the stream log in multiple files.
+ * This class implements the StreamLog by persisting the stream log as records in multiple files.
+ * This StreamLog implementation can detect log file corruption, if checksum is enabled, otherwise
+ * the checksum field will be ignored.
  *
  * StreamLogFiles:
- *     Header StreamEntryList
+ *     Header LogRecords
  *
  * Header: {@LogFileHeader}
  *
- * StreamEntryList: StreamEntry || StreamEntry StreamEntryList
+ * LogRecords: LogRecord || LogRecord LogRecords
  *
- * StreamEntryList: {
+ * LogRecord: {
+ *     delimiter 2 bytes
  *     checksum 4 bytes
- *     StreamEntry Size 4 bytes
- *     StreamEntry arbitrary number of bytes
+ *     address 4 bytes
+ *     data size 4 bytes
+ *     metadata size 4 bytes
+ *     serialized data
+ *     serialized metadata
  * }
  *
  * Created by maithem on 10/28/16.
@@ -52,13 +65,16 @@ import org.corfudb.runtime.exceptions.OverwriteException;
 @Slf4j
 public class StreamLogFiles implements StreamLog {
 
+    private final short recordDelimiter = 0x4C45;
     private String logDir;
     private boolean sync;
+    private boolean checksum;
     private Map<Long, FileHandle> channelMap;
 
-    public StreamLogFiles(String logDir, boolean sync) {
+    public StreamLogFiles(String logDir, boolean sync, boolean checksum) {
         this.logDir = logDir;
         this.sync = sync;
+        this.checksum = checksum;
         channelMap = new HashMap<>();
     }
 
@@ -92,35 +108,59 @@ public class StreamLogFiles implements StreamLog {
      * @param address The address of the entry.
      * @return The log unit entry at that address, or NULL if there was no entry.
      */
-    private LogData readEntry(FileHandle fh, long address)
+    private LogData readRecord(FileHandle fh, long address)
             throws IOException {
-        ByteBuffer o = fh.getMapForRegion(64, (int) fh.getChannel().size());
+        ByteBuffer o = fh.getMapForRegion(LogFileHeader.size, (int) fh.getChannel().size());
         while (o.hasRemaining()) {
-            short magic = o.getShort();
-            if (magic != 0x4C45) {
+            short delimiter = o.getShort();
+            if (delimiter != recordDelimiter) {
                 return null;
             }
-            short flags = o.getShort();
-            long addr = o.getLong();
+
+            Checksum checksumRead = new BufferChecksum();
+            checksumRead.deserialize(o);
+
+            ByteBuffer checksumBuf = o.slice();
+            long recordAddress = o.getLong();
+            int dataSize = o.getInt();
+            int metaDataSize = o.getInt();
+            int entrySize = dataSize + metaDataSize;
+
+            int recordLen = 8 // size of address
+                          + 4 // size of int for dataSize
+                          + 4 // size of int for metaDataSize
+                          + entrySize;
+
+            if(checksum) {
+                // Compute record checksum
+                byte[] bytes = new byte[recordLen];
+                checksumBuf.limit(recordLen);
+                checksumBuf.get(bytes);
+
+                Checksum recomputedChecksum = getChecksum(bytes);
+                if(!checksumRead.equals(recomputedChecksum)) {
+                    log.error("Checksum mismatch possibly around address {}, Stream log file {}", address,
+                            fh.getFilePath());
+                    throw new DataCorruptionException();
+                }
+            }
+
             if (address == -1) {
                 //Todo(Maithem) : maybe we can move this to getChannelForAddress
-                fh.knownAddresses.add(addr);
+                fh.knownAddresses.add(recordAddress);
             }
-            int size = o.getInt();
-            if (addr != address) {
-                o.position(o.position() + size - 16); //skip over (size-20 is what we haven't read).
-                log.trace("Read address {}, not match {}, skipping. (remain={})", addr, address, o.remaining());
+
+            if (recordAddress != address) {
+                o.position(o.position() + entrySize);
+                log.trace("Read address {}, not match {}, skipping. (remain={})", recordAddress, address, o.remaining());
             } else {
-                log.debug("Entry at {} hit, reading (size={}).", address, size);
-                if (flags % 2 == 0) {
-                    log.error("Read a log entry but the write was torn, aborting!");
-                    throw new IOException("Torn write detected!");
-                }
-                int metadataMapSize = o.getInt();
+                log.debug("Entry at {} hit, reading (size={}).", address, entrySize);
+
                 ByteBuf mBuf = Unpooled.wrappedBuffer(o.slice());
-                o.position(o.position() + metadataMapSize);
+                o.position(o.position() + metaDataSize);
+
                 ByteBuffer dBuf = o.slice();
-                dBuf.limit(size - metadataMapSize - 24);
+                dBuf.limit(dataSize);
                 return new LogData(Unpooled.wrappedBuffer(dBuf),
                         ICorfuPayload.enumMapFromBuffer(mBuf, IMetadata.LogUnitMetadataType.class, Object.class));
             }
@@ -146,10 +186,10 @@ public class StreamLogFiles implements StreamLog {
                 AtomicLong fp = new AtomicLong();
                 writeHeader(fc, fp, 1, 0);
                 log.info("Opened new log file at {}", filePath);
-                FileHandle fh = new FileHandle(fp, fc);
+                FileHandle fh = new FileHandle(fp, fc, filePath);
                 // The first time we open a file we should read to the end, to load the
                 // map of entries we already have.
-                readEntry(fh, -1);
+                readRecord(fh, -1);
                 return fh;
             } catch (IOException e) {
                 log.error("Error opening file {}", a, e);
@@ -166,26 +206,59 @@ public class StreamLogFiles implements StreamLog {
      * @param address The address of the entry.
      * @param entry   The LogUnitEntry to write.
      */
-    private void writeEntry(FileHandle fh, long address, LogData entry)
+    private void writeRecord(FileHandle fh, long address, LogData entry)
             throws IOException {
+
         ByteBuf metadataBuffer = Unpooled.buffer();
         ICorfuPayload.serialize(metadataBuffer, entry.getMetadataMap());
-        int entrySize = entry.getData().writerIndex() + metadataBuffer.writerIndex() + 24;
-        long pos = fh.getFilePointer().getAndAdd(entrySize);
-        ByteBuffer o = fh.getMapForRegion((int) pos, entrySize);
-        o.putInt(0x4C450000); // Flags
-        o.putLong(address); // the log unit address
-        o.putInt(entrySize); // Size
-        o.putInt(metadataBuffer.writerIndex()); // the metadata size
-        o.put(metadataBuffer.nioBuffer());
-        o.put(entry.getData().nioBuffer());
-        metadataBuffer.release();
-        o.putShort(2, (short) 1); // written flag
+
+        ByteBuf record = Unpooled.buffer();
+        int dataSize = entry.getData().writerIndex();
+        int metaDataSize = metadataBuffer.writerIndex();
+
+        // Constructing a record without a checksum
+        record.writeLong(address);
+        record.writeInt(dataSize);
+        record.writeInt(metaDataSize);
+        record.writeBytes(metadataBuffer.nioBuffer());
+        record.writeBytes(entry.getData().nioBuffer());
+
+        int recordSize = BufferChecksum.CHECKSUM_SIZE
+                + 2 // size of MagicNumber
+                + 8 // size of address
+                + 4 // size of int for dataSize
+                + 4 // size of int for metaDataSize
+                + dataSize
+                + metaDataSize;
+
+        // Write the record to a new memory mapped region
+        long pos = fh.getFilePointer().getAndAdd(recordSize);
+        ByteBuffer o = fh.getMapForRegion((int) pos, recordSize);
+        o.putShort(recordDelimiter);
+
+        // If --verify is true, then checksum will be computed for this record, otherwise
+        // the checksum field will be set to 0
+        if(checksum) {
+            byte [] subArray = Arrays.copyOfRange(record.array(), 0, record.writerIndex());
+            Checksum recordChecksum = getChecksum(subArray);
+            log.trace("Compute checksum {} for address {} entry {}", recordChecksum, address, entry);
+            recordChecksum.serialize(o);
+        } else {
+
+            // Write zeros in the checksum field
+            for(int x = 0; x < BufferChecksum.CHECKSUM_SIZE; x++) {
+                o.put((byte) 0);
+            }
+        }
+
+        o.put(record.array());
         o.flip();
+        metadataBuffer.release();
+        record.release();
     }
 
     @Override
-    public void append(long address, LogData entry) {
+    public synchronized void append(long address, LogData entry) {
         //evict the data by getting the next pointer.
         try {
             // make sure the entry doesn't currently exist...
@@ -194,11 +267,11 @@ public class StreamLogFiles implements StreamLog {
             if (!fh.getKnownAddresses().contains(address)) {
                 fh.getKnownAddresses().add(address);
                 if (sync) {
-                    writeEntry(fh, address, entry);
+                    writeRecord(fh, address, entry);
                 } else {
                     CompletableFuture.runAsync(() -> {
                         try {
-                            writeEntry(fh, address, entry);
+                            writeRecord(fh, address, entry);
                         } catch (Exception e) {
                             log.error("Disk_write[{}]: Exception", address, e);
                         }
@@ -217,7 +290,7 @@ public class StreamLogFiles implements StreamLog {
     @Override
     public LogData read(long address) {
         try {
-            return readEntry(getChannelForAddress(address), address);
+            return readRecord(getChannelForAddress(address), address);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -231,6 +304,7 @@ public class StreamLogFiles implements StreamLog {
         private FileChannel channel;
         private Set<Long> knownAddresses = Collections.newSetFromMap(new ConcurrentHashMap<>());
         private MappedByteBuffer byteBuffer;
+        final private String filePath;
 
         public ByteBuffer getMapForRegion(int offset, int size) {
             if (byteBuffer == null) {
@@ -254,6 +328,7 @@ public class StreamLogFiles implements StreamLog {
     @Data
     static class LogFileHeader {
         static final String magic = "CORFULOG";
+        static final int size = 64;
         final int version;
         final long flags;
 
@@ -268,7 +343,7 @@ public class StreamLogFiles implements StreamLog {
         }
 
         ByteBuffer getBuffer() {
-            ByteBuffer b = ByteBuffer.allocate(64);
+            ByteBuffer b = ByteBuffer.allocate(size);
             // 0: "CORFULOG" header(8)
             b.put(magic.getBytes(Charset.forName("UTF-8")), 0, 8);
             // 8: Version number(4)

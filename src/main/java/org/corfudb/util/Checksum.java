@@ -1,5 +1,7 @@
 package org.corfudb.util;
 
+import java.nio.ByteBuffer;
+
 /**
  * An interface representing a checksum for a sequence of bytes.
  *
@@ -18,4 +20,14 @@ public interface Checksum {
      * @return Returns the size of the checksum's value in bytes
      */
     int getSize();
+
+    /**
+     * Write serialized Checksum into buf
+     */
+    void serialize(ByteBuffer buf);
+
+    /**
+     * Deserialize buf into Checksum
+     */
+    void deserialize(ByteBuffer buf);
 }

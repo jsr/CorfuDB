@@ -22,6 +22,7 @@ public class ServerContextBuilder {
     int maxCache = 1000000;
     int checkpoint = 100;
     String address = "test";
+    boolean verify = true;
     int port = 9000;
     IServerRouter serverRouter;
 
@@ -40,6 +41,7 @@ public class ServerContextBuilder {
         }
          builder
                 .put("--sync", sync)
+                .put("--verify", verify)
                 .put("--max-cache", maxCache)
                 .put("--checkpoint", checkpoint)
                 .put("--address", address)
