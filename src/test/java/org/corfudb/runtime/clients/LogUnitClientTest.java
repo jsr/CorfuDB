@@ -7,6 +7,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import org.corfudb.infrastructure.AbstractServer;
 import org.corfudb.infrastructure.LogUnitServer;
+import org.corfudb.infrastructure.ServerContext;
+import org.corfudb.infrastructure.ServerContextBuilder;
 import org.corfudb.protocols.wireprotocol.DataType;
 import org.corfudb.protocols.wireprotocol.IMetadata;
 import org.corfudb.protocols.wireprotocol.LogData;
@@ -14,6 +16,7 @@ import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.exceptions.OverwriteException;
 import org.junit.Test;
 
+import java.io.File;
 import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
@@ -28,11 +31,23 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 public class LogUnitClientTest extends AbstractClientTest {
 
     LogUnitClient client;
+    ServerContext serverContext;
 
     @Override
     Set<AbstractServer> getServersForTest() {
+        String dirPath = getTempDir();
+        serverContext = new ServerContextBuilder()
+                .setInitialToken(0)
+                .setSingle(false)
+                .setVerify(true)
+                .setMemory(false)
+                .setLogPath(dirPath)
+                .setMaxCache(256000000)
+                .setSync(false)
+                .setServerRouter(serverRouter)
+                .build();
         return new ImmutableSet.Builder<AbstractServer>()
-                .add(new LogUnitServer(defaultServerContext()))
+                .add(new LogUnitServer(serverContext))
                 .build();
     }
 
@@ -64,7 +79,7 @@ public class LogUnitClientTest extends AbstractClientTest {
         client.write(0, Collections.<UUID>emptySet(), 0, testString, Collections.emptyMap()).get();
         assertThatThrownBy(() -> client.write(0, Collections.<UUID>emptySet(), 0,
                 testString, Collections.emptyMap()).get())
-                .isInstanceOf(ExecutionException.class)
+                .isInstanceOf(RuntimeException.class)
                 .hasCauseInstanceOf(OverwriteException.class);
     }
 
@@ -78,7 +93,7 @@ public class LogUnitClientTest extends AbstractClientTest {
                 .isEqualTo(DataType.HOLE);
 
         assertThatThrownBy(() -> client.write(0, Collections.<UUID>emptySet(), 0, testString, Collections.emptyMap()).get())
-                .isInstanceOf(ExecutionException.class)
+                .isInstanceOf(RuntimeException.class)
                 .hasCauseInstanceOf(OverwriteException.class);
     }
 
@@ -93,7 +108,7 @@ public class LogUnitClientTest extends AbstractClientTest {
                 .isEqualTo(DataType.DATA);
 
         assertThatThrownBy(() -> client.fillHole(0).get())
-                .isInstanceOf(ExecutionException.class)
+                .isInstanceOf(RuntimeException.class)
                 .hasCauseInstanceOf(OverwriteException.class);
     }
 
@@ -128,6 +143,12 @@ public class LogUnitClientTest extends AbstractClientTest {
         assertThat(r.getMetadataMap().get(IMetadata.LogUnitMetadataType.COMMIT));
 
         UUID streamA = CorfuRuntime.getStreamID("streamA");
+        // Create log directories for streams
+        String streamLogDir = (String) serverContext.getServerConfig().get("--log-path");
+        streamLogDir = streamLogDir + File.separator + "log";
+        File streamDir = new File(streamLogDir);
+        assertThat(streamDir.mkdir()).isTrue();
+
         client.writeStream(1, Collections.singletonMap(streamA, 0L), testString).get();
         client.writeCommit(Collections.singletonMap(streamA, 0L), 10L, true).get(); // 10L shouldn't matter
 
