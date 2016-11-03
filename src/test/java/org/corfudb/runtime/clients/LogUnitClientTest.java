@@ -9,14 +9,18 @@ import org.corfudb.infrastructure.AbstractServer;
 import org.corfudb.infrastructure.LogUnitServer;
 import org.corfudb.infrastructure.ServerContext;
 import org.corfudb.infrastructure.ServerContextBuilder;
+import org.corfudb.infrastructure.log.StreamLogFiles;
 import org.corfudb.protocols.wireprotocol.DataType;
 import org.corfudb.protocols.wireprotocol.IMetadata;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.exceptions.DataCorruptionException;
 import org.corfudb.runtime.exceptions.OverwriteException;
+import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
+import java.io.RandomAccessFile;
 import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
@@ -32,10 +36,12 @@ public class LogUnitClientTest extends AbstractClientTest {
 
     LogUnitClient client;
     ServerContext serverContext;
+    String dirPath;
+    LogUnitServer server;
 
     @Override
     Set<AbstractServer> getServersForTest() {
-        String dirPath = getTempDir();
+        dirPath = getTempDir();
         serverContext = new ServerContextBuilder()
                 .setInitialToken(0)
                 .setSingle(false)
@@ -46,8 +52,9 @@ public class LogUnitClientTest extends AbstractClientTest {
                 .setSync(false)
                 .setServerRouter(serverRouter)
                 .build();
+        server = new LogUnitServer(serverContext);
         return new ImmutableSet.Builder<AbstractServer>()
-                .add(new LogUnitServer(serverContext))
+                .add(server)
                 .build();
     }
 
@@ -81,6 +88,32 @@ public class LogUnitClientTest extends AbstractClientTest {
                 testString, Collections.emptyMap()).get())
                 .isInstanceOf(RuntimeException.class)
                 .hasCauseInstanceOf(OverwriteException.class);
+    }
+
+    @Test
+    public void CorruptedDataReadThrowsException() throws Exception {
+        byte[] testString = "hello world".getBytes();
+        client.write(0, Collections.<UUID>emptySet(), 0, testString, Collections.emptyMap()).get();
+        LogData r = client.read(0).get().getReadSet().get(0L);
+        // Verify that the data has been written correctly
+        assertThat(r.getPayload(null)).isEqualTo(testString);
+
+        // Corrupt the written log entry
+        String logDir = (String) serverContext.getServerConfig().get("--log-path");
+        String logFilePath = logDir + File.separator + "log0";
+        RandomAccessFile file = new RandomAccessFile(logFilePath, "rw");
+        file.seek(64 + 4); // File header + delimiter
+        file.writeInt(0xffff);
+        file.close();
+
+        // In order to clear the logunit's cache, the server is restarted so that
+        // the next read is forced to be retrieved from file and not the cache
+        server.reboot();
+
+        // Try to read a corrupted log entry
+        assertThatThrownBy(() -> client.read(0).get())
+                .isInstanceOf(RuntimeException.class)
+                .hasCauseInstanceOf(DataCorruptionException.class);
     }
 
     @Test

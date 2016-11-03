@@ -103,7 +103,7 @@ public class StreamLogFilesTest extends AbstractCorfuTest {
         log.close();
 
         // Overwrite 2 bytes of the checksum and 2 bytes of the entry's address
-        String logFilePath = logDir+ 0;
+        String logFilePath = logDir + 0;
         RandomAccessFile file = new RandomAccessFile(logFilePath, "rw");
         file.seek(StreamLogFiles.LogFileHeader.size + 4);
         file.writeInt(0xffff);
